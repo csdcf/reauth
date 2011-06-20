@@ -1,0 +1,343 @@
+#!/usr/bin/perl
+# $Id$
+#
+# Original version (C) Martin Schulz, 2'2002
+# University Karlsruhe
+#
+# Modifications by Miles Davis <miles@cs.stanford.edu>
+#  Super minimal -- call programs rather than functions to reduce dependence
+#  on extra perl modules.
+#
+# Heimdal patches thanks to Georgios Asimenos <asimenos@cs.stanford.edu>
+#
+
+# General:
+##########
+
+# This little script aims at maintaining a valid AFS token from a
+# users password for long running jobs.
+
+# As everybody knows (or should know) Kerberos tickets and AFS tokens
+# only have a limited lifetime. This is so by design and is usually
+# reasonable. After 12 hours, it is no more obvious that it is really
+# that user sitting in front of the computer that once typed the
+# correct password in. Furthermore the damage caused by compromized
+# AFS tokens is limited to the lifetime of that ticket.
+
+# However, there are situations when users want to use long running
+# jobs that will write to AFS filespace for several days. Renewable
+# tickets are not so much of help here, since they can only be renewed
+# if ....
+
+# Therefore the secret has somehow deposited on the local computer
+# that will run the long time job. This can be eiter done by storing a
+# keytab on the local disk, maybe with a cron(*) principal with
+# reduces priviledges. The approach taken here is to work with the
+# original password and keep it in RAM only.
+
+# When starting this program, the user is asked for his principal and
+# the corresponding password. Then the TGT and AFS token is obtained
+# and displayed, afterwards, a background process is forked and the
+# main process will return to the system prompt. The workload program
+# can now be started.
+
+# The background process will periodically attempt to obtain krb
+# tickets and AFS tokens. If this fails for some reason (Kerberos
+# server not available or anything, the program aborts.
+
+# aklog does not create a new pag if not told so. If you want your
+# background process have a separate pag, create it beforehand.
+
+# The reauth.pl program will work until eternity if is not stopped
+# somehow. The canonical way is kill it by "kill $pid", where $pid is
+# the process id printed before the return of the initial call to
+# reauth.pl or found in the output of "ps".
+
+
+# (*) Cron jobs are another issue. Our institute introduced
+# user.cron-style principals to enable cron to obtain a token and then
+# work on restricted parts of the users home directories.
+
+
+# Security issues:
+##################
+
+# reauth.pl will run forever if you do not stop it, so don't forget that!
+
+# The password is kept in RAM (of the child process). AFAIK, this can
+# only be recovered by local root (who you need to trust anyway). It
+# will not survive a reboot of the local machine.
+
+# The password is not kept on any disk. Therefore any bootfloppy
+# (reboot to single user mode..)  or screwdriver (take disk away..) 
+# attacks are not promising.
+
+# Be aware that your NSA-, FBI-, MI5-, KGB-, ElQaida-, or (*insert
+# your favorite opponent or competitor here*)-sponsored cleaning
+# personnel or coworkers might have even more elaborate means... :-)
+
+
+# BUGS:
+#######
+
+# Only mildly tested only on Linux and Solaris.
+
+# Uses kinit, aklog, klist and tokens programs for a KerberosV/ Ken
+# Hornstein's migration kit centered AFS setup. Please adjust to your
+# config.
+
+
+
+
+###########################################################################
+# Configs:
+
+
+# kinit program, add path if necessary
+if ( -e "/usr/kerberos/bin/kinit" ) {
+	$kinit="/usr/kerberos/bin/kinit";
+} elsif ( -e "/usr/lib/heimdal/bin/kinit" ) {
+	$kinit = "/usr/lib/heimdal/bin/kinit";
+} elsif ( -e "/usr/bin/kinit" ) {
+	$kinit="/usr/bin/kinit";
+} else {
+	die("Couln't find kinit.\n");
+}
+
+
+# aklog program, add path if necessary
+if ( -e "/usr/bin/aklog" ) {
+	$aklog="/usr/bin/aklog";
+} elsif ( -e "/usr/lib/heimdal/bin/afslog" ) {
+	# or, afslog, for heimdal weirdos
+	$aklog="/usr/lib/heimdal/bin/afslog";
+} else {
+	die("Couln't find aklog or afslog.\n");
+}
+
+# klist program, add path if necessary
+$klist="/usr/kerberos/bin/klist";
+
+# tokens program, add path if necessary
+$tokens="/usr/bin/tokens";
+
+
+#################################################################
+# Program:
+
+use Getopt::Long;
+use POSIX qw(setuid);
+use POSIX qw(setgid);
+use POSIX qw(setsid);
+
+# Defaults for command line options.
+my $keytab = '';
+my $command = '';
+my $username = '';
+my $debug = 0;
+my $verbose = 0;
+my $interval=15000; # time interval in seconds: 4+ hours:
+
+my %opts = (
+	# Keytab
+	'k=s' => sub {
+					$keytab = @_[1];
+					$kinit_opts .= "-k -t $keytab ";
+				},
+	# Run command
+	'c=s' => sub {
+					$command = @_[1];
+				},
+	# Run command as user
+	'u=s' => sub {
+					$username = @_[1];
+				},
+	# Time interval to sleep
+	'i=i' => sub {
+					$interval = @_[1];
+				},
+	# Debug
+	'd'   => sub {
+					$debug++;
+				},
+	# Be versbose
+	'v'   => sub {
+					$verbose++;
+				},
+);
+
+
+GetOptions(%opts) or die "Usage: reauth [ -k=keytab ] [ -u user ] [ -i <sleep_interval ] [ -v ] [ -c <command> ]\n";
+
+
+
+
+if(@ARGV) {
+	$princ = $ARGV[0];
+	debug_print(2, "Principal name provided by argument = $princ");
+} else {
+   # Assume we want the login name as the principal name
+	$princ = getpwuid($<);
+	debug_print(2, "Principal name provided by argument = $princ");
+}
+
+if ($keytab) {
+	# Don't ask for password, a keytab was provided.
+	debug_print(1, "Keytab provided = $keytab");
+} else {
+	# read password, but turn off echo before:
+	print "Password for $princ: ";
+	system "stty -echo";
+	$passwd = <STDIN>;
+	system "stty echo";
+	printf "\n";
+	chomp $passwd;
+	# Actually get the tickets/tokens
+	if(obtain_tokens()!=0) {
+		die "Can't obtain kerberos tickets\n";
+	}
+	if ($verbose) {
+		show_tokens();
+	}
+}
+
+# fork to go into background:
+# a) the parent will exit
+# b) the child will work on
+$pid = fork();
+if ($pid) {
+	# I am the parent.
+	printf "Background process pid is: $pid\n";
+	if ($command) {
+		debug_print(1,"Waiting for child to die.");
+		wait;
+		debug_print(1,"Child is dead.");
+	}
+	exit 0;
+} else {
+	# I am the child.
+	debug_print(2,"I am process $$");
+	print "Can't set session id\n" unless setsid();
+
+	debug_print(2,"KRB5CCNAME: " . $ENV{KRB5CCNAME});
+	#if ($ENV{KRB5CCNAME}) {
+		#$ENV{KRB5CCNAME} =  $ENV{KRB5CCNAME} . "_reauth_$$";
+	#} else {
+		#$ENV{KRB5CCNAME} =  "/tmp/krb5cc_reauth_$$";
+	#}
+
+	#debug_print(2,"Creating " . $ENV{KRB5CCNAME});
+	#system "touch $ENV{KRB5CCNAME}";
+	
+
+	if ($username) {
+		debug_print(1, "Looking up UID for $username");
+		($name,$passwd,$UID,$GID, @junk) = getpwnam($username);
+		debug_print(1, "Changing to UID $UID, GID $GID");
+		print "Can't set group id\n" unless setgid($GID);
+		print "Can't set user id\n" unless setuid($UID);
+		if ($ENV{KRB5CCNAME}) {
+			$ENV{KRB5CCNAME} =  $ENV{KRB5CCNAME} . "_reauth_$$";
+		} else {
+			$ENV{KRB5CCNAME} =  "/tmp/krb5cc_reauth_$$";
+		}
+	}
+
+	debug_print(2, "Running as uid " . $<);
+	# Actually get the tickets/tokens
+	if(obtain_tokens()!=0) {
+		die "Can't obtain kerberos tickets\n";
+	}
+
+	if ($verbose) {
+		show_tokens();
+	}
+
+	# If I was told to run a command, do it.
+	if ($command) {
+		debug_print(1,"About to exec $command");
+		exec($command) or die "Can't execute '$command'.\n";
+		exit
+	}
+
+	debug_print(2,"Going into auth loop (interval is $interval).");
+
+	#close(STDOUT);
+	#close(STDERR);
+
+	# Otherwise, work until killed:
+	while (1) {
+		debug_print(2,"Waking up to obtain new tokens.");
+		obtain_tokens();
+		if ($verbose) {
+			show_tokens();
+		}
+		sleep $interval;
+	};
+}
+
+#################################################################
+
+
+sub obtain_tokens() {
+
+  # ignore sigpipes' (according to perlopentut)
+  $SIG{PIPE} = 'IGNORE';
+
+	#debug_print(1,"Running: | $kinit -f $kinit_opts -p $princ 1>/dev/null 2>&1");
+
+  # run kinit
+  open(KINIT, "| $kinit -f $kinit_opts -p $princ 1>/dev/null 2>&1");
+
+  # pass password to stdin, password does not show up on command line
+  if (! $keytab) { 
+	  print(KINIT "${passwd}\n");
+  }
+ 
+  # close pipe and get status
+  close(KINIT); $status=$?;
+
+	debug_print(1,"kinit exited with status $status\n");
+  # act on status..
+  if($status == 256) {
+		if ($verbose) {
+			print "WARNING: kinit is not able to obtain Kerberos ticket ($status).\n";
+			print "         Possible DNS or network problem. Continuing anyway...\n";
+		}
+		return 1;
+  } elsif($status!=0) {
+    print "kinit is not able to obtain Kerberos ticket: $status\n";
+	 return 2;
+  };
+
+	debug_print(1,"Running $aklog...\n");
+  $status = system "$aklog >/dev/null" ;
+	debug_print(1,"aklog exited with status $status\n");
+  if($status!=0) {
+    print "aklog is not able to obtain AFS token: $status\n";
+	 return 3;
+  };
+
+  return 0;
+
+};
+
+##################################################################
+
+sub show_tokens() {
+	system $klist ;
+	system $tokens ;
+};
+
+##################################################################
+
+sub debug_print($$) {
+	my $level = shift;
+	my $message = shift;
+
+	if ($debug >= $level) {
+		print "DEBUG$debug: $message\n";
+	}
+}
+
+##################################################################
