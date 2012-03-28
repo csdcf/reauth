@@ -1,0 +1,58 @@
+#!/bin/bash
+# $Id$
+# vi: shiftwidth=4 tabstop=4 smarttab expandtab formatoptions=croql
+#
+# WARNING
+# This file is maintained by CSD-CF via puppet. Do not edit outside of puppet.
+# LOCAL CHANGES WILL BE LOST
+
+KINIT=/usr/kerberos/bin/kinit
+AUKS=/usr/bin/auks
+KRB5CC=$(echo $KRB5CCNAME | /bin/cut -d ':' -f 2)
+USER_UID=$(id -u $2)
+
+#put ticket in /tmp/$PID-kinit-check 
+$KINIT -R 2>/tmp/$$.reauth-kinit-check
+
+#check if ticket placement worked. 
+if [ ! $? -eq 0 ]; then 
+    echo -n "Error: "
+    /bin/cat /tmp/$$.reauth-kinit-check
+    /bin/rm -f /tmp/$$.reauth-kinit-check
+    echo 
+    echo "Can't renew your kerberos ticket."
+    echo "Try running 'kinit -r 30d' and resubmitting your job."
+    exit $?
+fi 
+
+#remove /tmp/$PID-kinit-check file
+/bin/rm -f /tmp/$$.reauth-kinit-check
+
+#Check if $KRB5CC file is a file
+if [ ! -f $KRB5CC ]; then
+    echo -n "Can't read kerberos credentials file $KRB5CC"
+    exit 1
+fi
+
+#add ticket to auks
+auks -a -C $KRB5CC >/dev/null 2>&1
+
+# if successful scream Wheeeee!!!!
+if [ $? -eq 0 ]; then 
+    echo -n "Wheeee!!!"
+fi
+
+# AUKS 
+# #  -g  Get credentials
+# #  -C  Credentials cache file to use
+# #  -R loop Go into background and keep credengials renewed
+# #
+/usr/bin/auks -u $USER_UID -g -C /tmp/krb5cc_$USER_UID
+
+# miles: Just a note, that when stored in the default location, /tmp/krb5cc_$UID, it's
+# trivial to gain a user's kerberos credentials via su. It's still pretty easy even
+# if you call the file something else, but you at least have to find the file and 
+# set / copy to KRB5CCNAME. With the default name, it's "automagic".
+
+echo "/usr/bin/auks -u $USER_UID -g -C /tmp/krb5cc_$USER_UID WHEEEEE!"
+/usr/bin/auks -g -C /tmp/krb5cc_$USER_UID -R loop > /dev/null &
